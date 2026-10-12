@@ -303,7 +303,7 @@ async def test_focuser_move_abort() -> None:
         await focuser._set_focus(10.0)
 
     assert halt_called is True
-    assert focuser.motion_status() == MotionStatus.POSITIONED
+    assert focuser.motion_status() == MotionStatus.IDLE
     assert not focuser._lock_motion.locked()
 
 
@@ -335,4 +335,205 @@ async def test_position_read_after_deadline_raises_timeout() -> None:
         await focuser._set_focus(10.0)
 
     assert focuser.motion_status() == MotionStatus.ERROR
+    assert not focuser._lock_motion.locked()
+
+
+@pytest.mark.asyncio
+async def test_stop_motion_aborts_active_move() -> None:
+    import asyncio
+
+    focuser = AlpacaFocuser(**_FOCUSER_ARGS, move_timeout=10.0)
+    target_steps = 500
+
+    move_started = asyncio.Event()
+    halt_called = asyncio.Event()
+
+    async def mock_get(prop: str) -> Any:
+        if prop == "StepSize":
+            return 20.0
+        if prop == "IsMoving":
+            move_started.set()
+            return not halt_called.is_set()
+        if prop == "Position":
+            return target_steps
+        return 0
+
+    async def mock_put(action: str, **kwargs: Any) -> None:
+        if action == "Halt":
+            halt_called.set()
+
+    focuser._device.get = mock_get  # type: ignore[assignment]
+    focuser._device.put = mock_put  # type: ignore[assignment]
+
+    task = asyncio.create_task(focuser._set_focus(10.0))
+
+    await move_started.wait()
+    assert focuser._lock_motion.locked()
+    assert focuser.motion_status() == MotionStatus.SLEWING
+
+    await focuser.stop_motion()
+
+    with pytest.raises(InterruptedError, match="Setting focus aborted"):
+        await task
+
+    assert halt_called.is_set()
+    assert not focuser._lock_motion.locked()
+    assert focuser.motion_status() == MotionStatus.IDLE
+    assert focuser.motion_status() != MotionStatus.POSITIONED
+
+
+@pytest.mark.asyncio
+async def test_subsequent_move_succeeds_after_abort() -> None:
+    import asyncio
+
+    focuser = AlpacaFocuser(**_FOCUSER_ARGS, move_timeout=10.0)
+    target_steps = 500
+
+    move_started = asyncio.Event()
+    halt_called = asyncio.Event()
+
+    async def mock_get(prop: str) -> Any:
+        if prop == "StepSize":
+            return 20.0
+        if prop == "IsMoving":
+            if not halt_called.is_set():
+                move_started.set()
+                return True
+            return False
+        if prop == "Position":
+            return target_steps
+        return 0
+
+    async def mock_put(action: str, **kwargs: Any) -> None:
+        if action == "Halt":
+            halt_called.set()
+
+    focuser._device.get = mock_get  # type: ignore[assignment]
+    focuser._device.put = mock_put  # type: ignore[assignment]
+
+    task = asyncio.create_task(focuser._set_focus(10.0))
+    await move_started.wait()
+    await focuser.stop_motion()
+    with pytest.raises(InterruptedError):
+        await task
+
+    # Second move should proceed normally without being cancelled by stale abort state
+    moving_states = [True, False]
+
+    async def mock_get_second(prop: str) -> Any:
+        if prop == "StepSize":
+            return 20.0
+        if prop == "IsMoving":
+            if moving_states:
+                return moving_states.pop(0)
+            return False
+        if prop == "Position":
+            return target_steps
+        return 0
+
+    focuser._device.get = mock_get_second  # type: ignore[assignment]
+    await focuser._set_focus(10.0)
+
+    assert focuser.motion_status() == MotionStatus.POSITIONED
+    assert not focuser._lock_motion.locked()
+
+
+@pytest.mark.asyncio
+async def test_stop_motion_halt_failure_raises_move_error_and_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    focuser = AlpacaFocuser(**_FOCUSER_ARGS, move_timeout=10.0)
+
+    async def mock_put(action: str, **kwargs: Any) -> None:
+        if action == "Halt":
+            raise RuntimeError("Halt communication failure")
+
+    focuser._device.put = mock_put  # type: ignore[assignment]
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(exc.MoveError, match="Could not halt focuser"):
+            await focuser.stop_motion()
+
+    assert "Could not halt focuser" in caplog.text
+    assert focuser.motion_status() == MotionStatus.ERROR
+
+
+@pytest.mark.asyncio
+async def test_abort_when_position_in_tolerance_not_mistaken_for_success() -> None:
+    import asyncio
+
+    focuser = AlpacaFocuser(**_FOCUSER_ARGS, move_timeout=10.0)
+    target_steps = 500
+
+    move_started = asyncio.Event()
+
+    async def mock_get(prop: str) -> Any:
+        if prop == "StepSize":
+            return 20.0
+        if prop == "IsMoving":
+            move_started.set()
+            return True
+        if prop == "Position":
+            return target_steps
+        return 0
+
+    async def mock_put(action: str, **kwargs: Any) -> None:
+        pass
+
+    focuser._device.get = mock_get  # type: ignore[assignment]
+    focuser._device.put = mock_put  # type: ignore[assignment]
+
+    task = asyncio.create_task(focuser._set_focus(10.0))
+    await move_started.wait()
+    await focuser.stop_motion()
+
+    with pytest.raises(InterruptedError, match="Setting focus aborted"):
+        await task
+
+    assert focuser.motion_status() == MotionStatus.IDLE
+    assert focuser.motion_status() != MotionStatus.POSITIONED
+    assert not focuser._lock_motion.locked()
+
+
+@pytest.mark.asyncio
+async def test_competing_motion_request_cancels_running_motion() -> None:
+    import asyncio
+
+    focuser = AlpacaFocuser(**_FOCUSER_ARGS, move_timeout=10.0)
+    target_steps = 500
+
+    first_move_started = asyncio.Event()
+    t1_done = asyncio.Event()
+
+    async def mock_get(prop: str) -> Any:
+        if prop == "StepSize":
+            return 20.0
+        if prop == "IsMoving":
+            if not t1_done.is_set():
+                first_move_started.set()
+                return True
+            return False
+        if prop == "Position":
+            return target_steps
+        return 0
+
+    async def mock_put(action: str, **kwargs: Any) -> None:
+        pass
+
+    focuser._device.get = mock_get  # type: ignore[assignment]
+    focuser._device.put = mock_put  # type: ignore[assignment]
+
+    task1 = asyncio.create_task(focuser._set_focus(10.0))
+    await first_move_started.wait()
+
+    task2 = asyncio.create_task(focuser._set_focus(10.0))
+
+    with pytest.raises(InterruptedError, match="Setting focus aborted"):
+        try:
+            await task1
+        finally:
+            t1_done.set()
+
+    await task2
+    assert focuser.motion_status() == MotionStatus.POSITIONED
     assert not focuser._lock_motion.locked()

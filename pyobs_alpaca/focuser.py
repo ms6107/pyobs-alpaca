@@ -119,14 +119,32 @@ class AlpacaFocuser(FocuserHeaderMixin, Module, MotionStatusMixin, IFocuser, IFi
                         await self._change_motion_status(MotionStatus.ERROR, interface="IFocuser")
                         raise exc.MoveError(f"Focuser move timed out waiting for position {target_steps}.")
                     if self._abort_motion.is_set():
-                        await self._device.put("Halt")
-                        await self._change_motion_status(MotionStatus.POSITIONED, interface="IFocuser")
+                        self._abort_motion.clear()
+                        halt_ok = True
+                        try:
+                            await self._device.put("Halt")
+                        except Exception as e:
+                            halt_ok = False
+                            log.warning("Failed to halt focuser after abort: %s", e)
+                        if self.motion_status() != MotionStatus.ERROR:
+                            await self._change_motion_status(
+                                MotionStatus.IDLE if halt_ok else MotionStatus.ERROR, interface="IFocuser"
+                            )
                         raise InterruptedError("Setting focus aborted.")
                     await asyncio.sleep(0.1)
 
                 if self._abort_motion.is_set():
-                    await self._device.put("Halt")
-                    await self._change_motion_status(MotionStatus.POSITIONED, interface="IFocuser")
+                    self._abort_motion.clear()
+                    halt_ok = True
+                    try:
+                        await self._device.put("Halt")
+                    except Exception as e:
+                        halt_ok = False
+                        log.warning("Failed to halt focuser after abort: %s", e)
+                    if self.motion_status() != MotionStatus.ERROR:
+                        await self._change_motion_status(
+                            MotionStatus.IDLE if halt_ok else MotionStatus.ERROR, interface="IFocuser"
+                        )
                     raise InterruptedError("Setting focus aborted.")
 
                 pos = await self._device.get("Position")
@@ -158,7 +176,16 @@ class AlpacaFocuser(FocuserHeaderMixin, Module, MotionStatusMixin, IFocuser, IFi
 
     async def stop_motion(self, device: str | None = None, **kwargs: Any) -> None:
         """Stop the motion."""
-        await self._device.put("Halt")
+        self._abort_motion.set()
+        try:
+            await self._device.put("Halt")
+        except Exception as e:
+            log.warning("Could not halt focuser: %s", e)
+            await self._change_motion_status(MotionStatus.ERROR, interface="IFocuser")
+            raise exc.MoveError(f"Could not halt focuser: {e}") from e
+        finally:
+            if not self._lock_motion.locked():
+                self._abort_motion.clear()
 
 
 __all__ = ["AlpacaFocuser"]
