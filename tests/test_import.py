@@ -8,6 +8,7 @@ tasks, which never start until open() is called.
 
 from pyobs.interfaces import (
     IAbortable,
+    IBinning,
     ICamera,
     IDome,
     IFitsHeaderBefore,
@@ -15,6 +16,7 @@ from pyobs.interfaces import (
     IOffsetsRaDec,
     ISyncTarget,
     ITelescope,
+    IWindow,
 )
 from pyobs.object import Object
 
@@ -52,4 +54,6 @@ def test_import_dome_and_instantiate() -> None:
 def test_import_camera_and_instantiate() -> None:
     camera = AlpacaCamera(server="localhost", port=11111, device=0)
     assert isinstance(camera, ICamera)
+    assert isinstance(camera, IWindow)
+    assert isinstance(camera, IBinning)
     assert isinstance(camera, IAbortable)

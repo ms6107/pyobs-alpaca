@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import numpy as np
 import pytest
 from numpy.typing import NDArray
+from pyobs.interfaces import Binning, IBinning, IWindow
 from pyobs.utils import exceptions as exc
 from pyobs.utils.enums import ExposureStatus, ImageType
 
@@ -25,6 +26,9 @@ class FakeAlpacaCameraTransport:
             "CameraYSize": 1096,
             "PixelSizeX": 2.9,
             "PixelSizeY": 2.9,
+            "MaxBinX": 4,
+            "MaxBinY": 4,
+            "CanAsymmetricBin": False,
             "SensorType": 0,
             "BayerOffsetX": 0,
             "BayerOffsetY": 0,
@@ -94,6 +98,7 @@ def _make_camera(
     )
     cam._device = fake  # type: ignore[assignment]
     cam._child_objects = [fake]  # type: ignore[list-item]
+    cam.comm.set_capabilities = AsyncMock()  # type: ignore[method-assign]
     cam.comm.set_state = AsyncMock()  # type: ignore[method-assign]
     cam.comm.send_event = AsyncMock()  # type: ignore[method-assign]
     cam.comm.register_event = AsyncMock()  # type: ignore[method-assign]
@@ -112,7 +117,7 @@ def test_init_validates_poll_and_timeout_bounds() -> None:
 
 
 @pytest.mark.asyncio
-async def test_open_monochrome_skips_bayer_offsets() -> None:
+async def test_open_monochrome_skips_bayer_offsets_and_publishes_capabilities() -> None:
     fake = FakeAlpacaCameraTransport()
     cam = _make_camera(fake)
     await cam.open()
@@ -121,11 +126,23 @@ async def test_open_monochrome_skips_bayer_offsets() -> None:
     assert cam._meta.camera_x_size == 1936
     assert cam._meta.camera_y_size == 1096
     assert cam._meta.pixel_size_x_um == 2.9
+    assert cam._meta.max_bin_x == 4
+    assert cam._meta.max_bin_y == 4
+    assert cam._meta.can_asymmetric_bin is False
     assert cam._meta.sensor_type == 0
     assert cam._meta.bayer_offset_x == 0
     assert cam._meta.bayer_offset_y == 0
     assert "BayerOffsetX" not in fake.gets
     assert "BayerOffsetY" not in fake.gets
+
+    assert await cam.get_full_frame() == (0, 0, 1936, 1096)
+    assert await cam.get_window() == (0, 0, 1936, 1096)
+    assert await cam.get_binning() == (1, 1)
+
+    cap_calls = {call.args[0]: call.args[1] for call in cam.comm.set_capabilities.call_args_list}  # type: ignore[attr-defined]
+    assert cap_calls[IWindow].full_frame_width == 1936
+    assert cap_calls[IWindow].full_frame_height == 1096
+    assert cap_calls[IBinning].binnings == [Binning(1, 1), Binning(2, 2), Binning(3, 3), Binning(4, 4)]
 
     await cam.close()
     assert fake.closed
@@ -139,6 +156,9 @@ async def test_open_connects_if_disconnected_and_queries_bayer_offsets_for_rggb(
             "SensorType": 2,
             "BayerOffsetX": 1,
             "BayerOffsetY": 0,
+            "MaxBinX": 2,
+            "MaxBinY": 2,
+            "CanAsymmetricBin": True,
         }
     )
     cam = _make_camera(fake)
@@ -150,13 +170,54 @@ async def test_open_connects_if_disconnected_and_queries_bayer_offsets_for_rggb(
     assert cam._meta.bayer_offset_x == 1
     assert cam._meta.bayer_offset_y == 0
 
+    cap_calls = {call.args[0]: call.args[1] for call in cam.comm.set_capabilities.call_args_list}  # type: ignore[attr-defined]
+    assert cap_calls[IBinning].binnings == [Binning(1, 1), Binning(1, 2), Binning(2, 1), Binning(2, 2)]
+
 
 @pytest.mark.asyncio
-async def test_open_rejects_nonpositive_sensor_dimensions() -> None:
-    fake = FakeAlpacaCameraTransport({"CameraXSize": 0})
-    cam = _make_camera(fake)
+async def test_open_rejects_invalid_sensor_dimensions_or_max_bin() -> None:
+    fake_dim = FakeAlpacaCameraTransport({"CameraXSize": 0})
+    cam_dim = _make_camera(fake_dim)
     with pytest.raises(ConnectionError, match="Invalid sensor dimensions"):
-        await cam.open()
+        await cam_dim.open()
+
+    fake_bin = FakeAlpacaCameraTransport({"MaxBinX": 0})
+    cam_bin = _make_camera(fake_bin)
+    with pytest.raises(ConnectionError, match="Invalid maximum binning"):
+        await cam_bin.open()
+
+
+@pytest.mark.asyncio
+async def test_window_and_binning_validation() -> None:
+    fake = FakeAlpacaCameraTransport()
+    cam = _make_camera(fake)
+
+    with pytest.raises(ValueError, match="not initialized"):
+        await cam.set_window(0, 0, 100, 100)
+    with pytest.raises(ValueError, match="not initialized"):
+        await cam.set_binning(1, 1)
+
+    await cam.open()
+
+    await cam.set_window(10, 20, 400, 300)
+    assert await cam.get_window() == (10, 20, 400, 300)
+
+    with pytest.raises(ValueError, match="non-negative"):
+        await cam.set_window(-1, 0, 100, 100)
+    with pytest.raises(ValueError, match="positive"):
+        await cam.set_window(0, 0, 0, 100)
+    with pytest.raises(ValueError, match="exceeds sensor dimensions"):
+        await cam.set_window(1000, 0, 1000, 100)
+
+    await cam.set_binning(2, 2)
+    assert await cam.get_binning() == (2, 2)
+
+    with pytest.raises(ValueError, match="out of supported range"):
+        await cam.set_binning(0, 0)
+    with pytest.raises(ValueError, match="out of supported range"):
+        await cam.set_binning(5, 5)
+    with pytest.raises(ValueError, match="Asymmetric binning"):
+        await cam.set_binning(1, 2)
 
 
 @pytest.mark.asyncio
@@ -167,9 +228,13 @@ async def test_reset_and_full_reset() -> None:
 
     await cam.set_exposure_time(5.0)
     await cam.set_image_type(ImageType.DARK)
+    await cam.set_binning(2, 2)
+    await cam.set_window(10, 20, 200, 100)
     await cam.reset()
     assert cam._exposure_time == 0.0
     assert cam._image_type == ImageType.OBJECT
+    assert await cam.get_binning() == (1, 1)
+    assert await cam.get_window() == (0, 0, 1936, 1096)
 
     fake.puts.clear()
     await cam.full_reset()
@@ -182,21 +247,35 @@ async def test_reset_and_full_reset() -> None:
 
 
 @pytest.mark.asyncio
-async def test_expose_light_frame_polls_until_ready_and_populates_headers() -> None:
+async def test_expose_applies_binned_roi_and_populates_headers() -> None:
     fake = FakeAlpacaCameraTransport()
     fake.image_ready_sequence = [False, True]
     fake.image_array = np.array([[100, 200, 300, 400], [500, 600, 700, 800]], dtype=np.uint16)
     cam = _make_camera(fake)
     await cam.open()
 
+    await cam.set_binning(2, 2)
+    await cam.set_window(20, 40, 8, 4)
+
     abort_event = asyncio.Event()
     img = await cam._expose(0.02, open_shutter=True, abort_event=abort_event)
 
+    assert ("BinX", {"BinX": 2}) in fake.puts
+    assert ("BinY", {"BinY": 2}) in fake.puts
+    assert ("StartX", {"StartX": 10}) in fake.puts
+    assert ("StartY", {"StartY": 20}) in fake.puts
+    assert ("NumX", {"NumX": 4}) in fake.puts
+    assert ("NumY", {"NumY": 2}) in fake.puts
     assert ("StartExposure", {"Duration": 0.02, "Light": True}) in fake.puts
+
     assert img.data.shape == (2, 4)
     assert img.data.dtype == np.uint16
     assert img.header["NAXIS1"] == 4
     assert img.header["NAXIS2"] == 2
+    assert img.header["XBINNING"] == 2
+    assert img.header["YBINNING"] == 2
+    assert img.header["XORGSUBF"] == 20
+    assert img.header["YORGSUBF"] == 40
     assert img.header["EXPTIME"] == 0.02
     assert img.header["INSTRUME"] == "ZWO ASI290MM Mini"
     assert img.header["DETECTOR"] == "IMX290"
@@ -204,6 +283,20 @@ async def test_expose_light_frame_polls_until_ready_and_populates_headers() -> N
     assert img.header["DATAMIN"] == 100.0
     assert img.header["DATAMAX"] == 800.0
     assert "BAYERPAT" not in img.header
+
+    # Changing window or binning while an exposure is in flight must not corrupt that exposure's FITS header
+    await cam.set_binning(1, 1)
+    await cam.set_window(0, 0, 1936, 1096)
+    fake.image_ready_sequence = [False, True]
+    expose_task = asyncio.create_task(cam._expose(0.05, open_shutter=True, abort_event=asyncio.Event()))
+    await asyncio.sleep(0)
+    await cam.set_binning(2, 2)
+    await cam.set_window(100, 100, 400, 300)
+    inflight_img = await expose_task
+    assert inflight_img.header["XBINNING"] == 1
+    assert inflight_img.header["YBINNING"] == 1
+    assert inflight_img.header["XORGSUBF"] == 0
+    assert inflight_img.header["YORGSUBF"] == 0
 
 
 @pytest.mark.asyncio
@@ -306,3 +399,20 @@ async def test_expose_error_paths() -> None:
     await cam_dl.open()
     with pytest.raises(exc.GrabImageError, match="Could not download image array"):
         await cam_dl._expose(0.01, open_shutter=True, abort_event=asyncio.Event())
+
+    # 5. Binned window dimensions <= 0 (e.g. 1x1 window with 2x2 binning)
+    fake_roi = FakeAlpacaCameraTransport()
+    cam_roi = _make_camera(fake_roi)
+    await cam_roi.open()
+    await cam_roi.set_binning(2, 2)
+    await cam_roi.set_window(0, 0, 1, 1)
+    with pytest.raises(exc.GrabImageError, match="Binned window dimensions"):
+        await cam_roi._expose(0.01, open_shutter=True, abort_event=asyncio.Event())
+
+    # 6. PUT BinX failure
+    fake_bin_err = FakeAlpacaCameraTransport()
+    fake_bin_err.fail_on_put.add("BinX")
+    cam_bin_err = _make_camera(fake_bin_err)
+    await cam_bin_err.open()
+    with pytest.raises(exc.GrabImageError, match="Could not configure camera window/binning"):
+        await cam_bin_err._expose(0.01, open_shutter=True, abort_event=asyncio.Event())
