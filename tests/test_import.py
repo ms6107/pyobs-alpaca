@@ -13,6 +13,7 @@ from pyobs.interfaces import (
     IDome,
     IFitsHeaderBefore,
     IFocuser,
+    IGain,
     IOffsetsRaDec,
     ISyncTarget,
     ITelescope,
@@ -56,4 +57,5 @@ def test_import_camera_and_instantiate() -> None:
     assert isinstance(camera, ICamera)
     assert isinstance(camera, IWindow)
     assert isinstance(camera, IBinning)
+    assert isinstance(camera, IGain)
     assert isinstance(camera, IAbortable)

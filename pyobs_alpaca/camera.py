@@ -16,8 +16,10 @@ from pyobs.interfaces import (
     Binning,
     BinningCapabilities,
     BinningState,
+    GainState,
     IAbortable,
     IBinning,
+    IGain,
     IWindow,
     WindowCapabilities,
     WindowState,
@@ -52,6 +54,10 @@ class CameraMetadata:
     bayer_offset_x: int
     bayer_offset_y: int
     can_abort_exposure: bool
+    gain_min: int | None
+    gain_max: int | None
+    offset_min: int | None
+    offset_max: int | None
     description: str
     sensor_name: str
 
@@ -60,6 +66,7 @@ class AlpacaCamera(
     BaseCamera,
     IWindow,
     IBinning,
+    IGain,
     IAbortable,
 ):
     """A pyobs camera module for ASCOM Alpaca camera devices (ICameraV3)."""
@@ -68,6 +75,8 @@ class AlpacaCamera(
 
     def __init__(
         self,
+        default_gain: float | None = None,
+        default_offset: float | None = None,
         poll_interval: float = 0.2,
         readout_timeout: float = 30.0,
         **kwargs: Any,
@@ -85,12 +94,16 @@ class AlpacaCamera(
         device_kwargs.setdefault("device_type", "camera")
         self._device: AlpacaDevice = self.add_child_object(AlpacaDevice, **device_kwargs)
 
+        self._default_gain = default_gain
+        self._default_offset = default_offset
         self._poll_interval = poll_interval
         self._readout_timeout = readout_timeout
         self._meta: CameraMetadata | None = None
         self._full_frame: tuple[int, int, int, int] = (0, 0, 0, 0)
         self._window: tuple[int, int, int, int] = (0, 0, 0, 0)
         self._binning: tuple[int, int] = (1, 1)
+        self._gain: float | None = None
+        self._offset: float | None = None
 
     async def _try_get(self, attribute: str) -> Any:
         """Query an optional ASCOM property that may raise PropertyNotImplemented (1024)."""
@@ -126,6 +139,35 @@ class AlpacaCamera(
                 bayer_offset_y = int(raw_by)
 
         can_abort_exposure = bool(await self._device.get("CanAbortExposure"))
+
+        raw_gain_min = await self._try_get("GainMin")
+        raw_gain_max = await self._try_get("GainMax")
+        if raw_gain_min is not None and raw_gain_max is not None:
+            gain_min: int | None = int(raw_gain_min)
+            gain_max: int | None = int(raw_gain_max)
+        else:
+            raw_gains = await self._try_get("Gains")
+            if isinstance(raw_gains, list) and len(raw_gains) > 0:
+                gain_min = 0
+                gain_max = len(raw_gains) - 1
+            else:
+                gain_min = None
+                gain_max = None
+
+        raw_offset_min = await self._try_get("OffsetMin")
+        raw_offset_max = await self._try_get("OffsetMax")
+        if raw_offset_min is not None and raw_offset_max is not None:
+            offset_min: int | None = int(raw_offset_min)
+            offset_max: int | None = int(raw_offset_max)
+        else:
+            raw_offsets = await self._try_get("Offsets")
+            if isinstance(raw_offsets, list) and len(raw_offsets) > 0:
+                offset_min = 0
+                offset_max = len(raw_offsets) - 1
+            else:
+                offset_min = None
+                offset_max = None
+
         description = str(await self._device.get("Description"))
         sensor_name = str(await self._device.get("SensorName"))
 
@@ -141,6 +183,10 @@ class AlpacaCamera(
             bayer_offset_x=bayer_offset_x,
             bayer_offset_y=bayer_offset_y,
             can_abort_exposure=can_abort_exposure,
+            gain_min=gain_min,
+            gain_max=gain_max,
+            offset_min=offset_min,
+            offset_max=offset_max,
             description=description,
             sensor_name=sensor_name,
         )
@@ -166,6 +212,24 @@ class AlpacaCamera(
         self._window = self._full_frame
         self._binning = (1, 1)
 
+        if meta.gain_min is not None:
+            if self._default_gain is not None:
+                await self.set_gain(self._default_gain)
+            else:
+                raw_gain = await self._try_get("Gain")
+                self._gain = float(raw_gain) if raw_gain is not None else float(meta.gain_min)
+        else:
+            self._gain = None
+
+        if meta.offset_min is not None:
+            if self._default_offset is not None:
+                await self.set_offset(self._default_offset)
+            else:
+                raw_offset = await self._try_get("Offset")
+                self._offset = float(raw_offset) if raw_offset is not None else float(meta.offset_min)
+        else:
+            self._offset = None
+
         await self.comm.set_capabilities(
             IWindow,
             WindowCapabilities(
@@ -189,6 +253,14 @@ class AlpacaCamera(
             ),
         )
         await self.comm.set_state(IBinning, BinningState(x=self._binning[0], y=self._binning[1]))
+        if self._gain is not None or self._offset is not None:
+            await self.comm.set_state(
+                IGain,
+                GainState(
+                    gain=self._gain if self._gain is not None else 0.0,
+                    offset=self._offset if self._offset is not None else 0.0,
+                ),
+            )
 
     async def close(self) -> None:
         """Close the camera module and release the underlying HTTP session."""
@@ -196,11 +268,15 @@ class AlpacaCamera(
         await super().close()
 
     async def reset(self, **kwargs: Any) -> None:
-        """Reset exposure time, image type, binning, window, and pipeline to their defaults."""
+        """Reset exposure time, image type, binning, window, gain, offset, and pipeline to their defaults."""
         await BaseCamera.reset(self, **kwargs)
         if self._meta is not None:
             await self.set_binning(1, 1)
             await self.set_window(*self._full_frame)
+            if self._default_gain is not None and self._meta.gain_min is not None:
+                await self.set_gain(self._default_gain)
+            if self._default_offset is not None and self._meta.offset_min is not None:
+                await self.set_offset(self._default_offset)
 
     async def full_reset(self, **kwargs: Any) -> None:
         """Reconnect the Alpaca camera hardware and reset settings to defaults."""
@@ -253,6 +329,66 @@ class AlpacaCamera(
         self._binning = (x, y)
         await self.comm.set_state(IBinning, BinningState(x=x, y=y))
 
+    async def get_gain(self, **kwargs: Any) -> float:
+        """Return the current camera gain."""
+        if self._gain is None:
+            raise ValueError("Camera does not support gain.")
+        return self._gain
+
+    async def set_gain(self, gain: float, **kwargs: Any) -> None:
+        """Set the camera gain within [gain_min, gain_max]."""
+        if self._meta is None or self._meta.gain_min is None or self._meta.gain_max is None:
+            raise ValueError("Camera does not support setting gain.")
+        if not math.isfinite(gain):
+            raise ValueError("Gain must be finite.")
+        gain_int = int(round(gain))
+        if gain_int < self._meta.gain_min or gain_int > self._meta.gain_max:
+            raise ValueError(
+                f"Gain {gain_int} is outside supported range [{self._meta.gain_min}, {self._meta.gain_max}]."
+            )
+        try:
+            await self._device.put("Gain", Gain=gain_int)
+        except ConnectionError as e:
+            raise ValueError(f"Could not set camera gain: {e}") from e
+        self._gain = float(gain_int)
+        await self.comm.set_state(
+            IGain,
+            GainState(
+                gain=self._gain,
+                offset=self._offset if self._offset is not None else 0.0,
+            ),
+        )
+
+    async def get_offset(self, **kwargs: Any) -> float:
+        """Return the current camera offset."""
+        if self._offset is None:
+            raise ValueError("Camera does not support offset.")
+        return self._offset
+
+    async def set_offset(self, offset: float, **kwargs: Any) -> None:
+        """Set the camera offset within [offset_min, offset_max]."""
+        if self._meta is None or self._meta.offset_min is None or self._meta.offset_max is None:
+            raise ValueError("Camera does not support setting offset.")
+        if not math.isfinite(offset):
+            raise ValueError("Offset must be finite.")
+        offset_int = int(round(offset))
+        if offset_int < self._meta.offset_min or offset_int > self._meta.offset_max:
+            raise ValueError(
+                f"Offset {offset_int} is outside supported range [{self._meta.offset_min}, {self._meta.offset_max}]."
+            )
+        try:
+            await self._device.put("Offset", Offset=offset_int)
+        except ConnectionError as e:
+            raise ValueError(f"Could not set camera offset: {e}") from e
+        self._offset = float(offset_int)
+        await self.comm.set_state(
+            IGain,
+            GainState(
+                gain=self._gain if self._gain is not None else 0.0,
+                offset=self._offset,
+            ),
+        )
+
     async def _apply_roi_and_binning(self, window: tuple[int, int, int, int], binning: tuple[int, int]) -> None:
         """Push binning and binned ROI coordinates to the Alpaca camera before exposure."""
         bx, by = binning
@@ -293,6 +429,8 @@ class AlpacaCamera(
         data: NDArray[Any],
         window: tuple[int, int, int, int],
         binning: tuple[int, int],
+        gain: float | None,
+        offset: float | None,
     ) -> None:
         """Populate standard FITS keywords on the captured image."""
         if self._meta is None:
@@ -327,6 +465,11 @@ class AlpacaCamera(
             )
             hdr["DETECTOR"] = (detector, "Name of detector")
 
+        if gain is not None:
+            hdr["GAIN"] = (gain, "Gain used for exposure")
+        if offset is not None:
+            hdr["OFFSET"] = (offset, "Offset used for exposure")
+
         if self._meta.sensor_type == _SENSOR_TYPE_RGGB:
             hdr["BAYERPAT"] = ("RGGB", "Bayer color pattern")
             hdr["XBAYROFF"] = (self._meta.bayer_offset_x, "Bayer X offset")
@@ -352,6 +495,8 @@ class AlpacaCamera(
         log.info("Starting %.3fs exposure with %s shutter...", exposure_time, "open" if open_shutter else "closed")
         window = self._window
         binning = self._binning
+        gain = self._gain
+        offset = self._offset
         await self._apply_roi_and_binning(window, binning)
         date_obs = datetime.now(UTC)
 
@@ -412,7 +557,16 @@ class AlpacaCamera(
 
         data = self._normalize_image_data(raw_data)
         image = Image(data)
-        self._populate_header(image.header, exposure_time, date_obs, data, window=window, binning=binning)
+        self._populate_header(
+            image.header,
+            exposure_time,
+            date_obs,
+            data,
+            window=window,
+            binning=binning,
+            gain=gain,
+            offset=offset,
+        )
         log.info("Exposure finished.")
         return image
 

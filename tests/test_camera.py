@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import numpy as np
 import pytest
 from numpy.typing import NDArray
-from pyobs.interfaces import Binning, IBinning, IWindow
+from pyobs.interfaces import Binning, GainState, IBinning, IGain, IWindow
 from pyobs.utils import exceptions as exc
 from pyobs.utils.enums import ExposureStatus, ImageType
 
@@ -33,6 +33,12 @@ class FakeAlpacaCameraTransport:
             "BayerOffsetX": 0,
             "BayerOffsetY": 0,
             "CanAbortExposure": True,
+            "GainMin": 0,
+            "GainMax": 600,
+            "Gain": 120,
+            "OffsetMin": 0,
+            "OffsetMax": 100,
+            "Offset": 10,
             "ImageReady": True,
             "CameraState": 0,
         }
@@ -71,6 +77,10 @@ class FakeAlpacaCameraTransport:
             raise ConnectionError(f"Alpaca PUT error on {attribute}")
         if attribute == "Connected" and "Connected" in kwargs:
             self.props["Connected"] = bool(kwargs["Connected"])
+        elif attribute == "Gain" and "Gain" in kwargs:
+            self.props["Gain"] = int(kwargs["Gain"])
+        elif attribute == "Offset" and "Offset" in kwargs:
+            self.props["Offset"] = int(kwargs["Offset"])
         return None
 
     async def get_imagebytes(self, attribute: str = "imagearray", timeout: float = 30.0) -> NDArray[Any]:
@@ -88,6 +98,8 @@ def _make_camera(
     fake: FakeAlpacaCameraTransport,
     poll_interval: float = 0.01,
     readout_timeout: float = 0.5,
+    default_gain: float | None = None,
+    default_offset: float | None = None,
 ) -> AlpacaCamera:
     cam = AlpacaCamera(
         server="127.0.0.1",
@@ -95,6 +107,8 @@ def _make_camera(
         device=0,
         poll_interval=poll_interval,
         readout_timeout=readout_timeout,
+        default_gain=default_gain,
+        default_offset=default_offset,
     )
     cam._device = fake  # type: ignore[assignment]
     cam._child_objects = [fake]  # type: ignore[list-item]
@@ -132,12 +146,18 @@ async def test_open_monochrome_skips_bayer_offsets_and_publishes_capabilities() 
     assert cam._meta.sensor_type == 0
     assert cam._meta.bayer_offset_x == 0
     assert cam._meta.bayer_offset_y == 0
+    assert cam._meta.gain_min == 0
+    assert cam._meta.gain_max == 600
+    assert cam._meta.offset_min == 0
+    assert cam._meta.offset_max == 100
     assert "BayerOffsetX" not in fake.gets
     assert "BayerOffsetY" not in fake.gets
 
     assert await cam.get_full_frame() == (0, 0, 1936, 1096)
     assert await cam.get_window() == (0, 0, 1936, 1096)
     assert await cam.get_binning() == (1, 1)
+    assert await cam.get_gain() == 120.0
+    assert await cam.get_offset() == 10.0
 
     cap_calls = {call.args[0]: call.args[1] for call in cam.comm.set_capabilities.call_args_list}  # type: ignore[attr-defined]
     assert cap_calls[IWindow].full_frame_width == 1936
@@ -221,20 +241,108 @@ async def test_window_and_binning_validation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reset_and_full_reset() -> None:
+async def test_gain_and_offset_supported_and_unsupported() -> None:
     fake = FakeAlpacaCameraTransport()
     cam = _make_camera(fake)
     await cam.open()
+
+    await cam.set_gain(250.0)
+    assert await cam.get_gain() == 250.0
+    assert ("Gain", {"Gain": 250}) in fake.puts
+
+    await cam.set_offset(35.0)
+    assert await cam.get_offset() == 35.0
+    assert ("Offset", {"Offset": 35}) in fake.puts
+
+    state_calls = [call.args[1] for call in cam.comm.set_state.call_args_list if call.args[0] is IGain]  # type: ignore[attr-defined]
+    assert isinstance(state_calls[-1], GainState)
+    assert state_calls[-1].gain == 250.0
+    assert state_calls[-1].offset == 35.0
+
+    with pytest.raises(ValueError, match="outside supported range"):
+        await cam.set_gain(-1.0)
+    with pytest.raises(ValueError, match="outside supported range"):
+        await cam.set_gain(601.0)
+    with pytest.raises(ValueError, match="finite"):
+        await cam.set_gain(float("nan"))
+
+    with pytest.raises(ValueError, match="outside supported range"):
+        await cam.set_offset(-1.0)
+    with pytest.raises(ValueError, match="outside supported range"):
+        await cam.set_offset(101.0)
+    with pytest.raises(ValueError, match="finite"):
+        await cam.set_offset(float("inf"))
+
+    # Discrete list mode (Gains / Offsets arrays when GainMin/Max and OffsetMin/Max raise 1024)
+    fake_discrete = FakeAlpacaCameraTransport(
+        {
+            "GainMin": None,
+            "GainMax": None,
+            "Gains": ["ISO 100", "ISO 200", "ISO 400", "ISO 800"],
+            "Gain": 1,
+            "OffsetMin": None,
+            "OffsetMax": None,
+            "Offsets": ["Low", "Medium", "High"],
+            "Offset": 0,
+        }
+    )
+    cam_discrete = _make_camera(fake_discrete)
+    await cam_discrete.open()
+    assert cam_discrete._meta is not None
+    assert cam_discrete._meta.gain_min == 0
+    assert cam_discrete._meta.gain_max == 3
+    assert cam_discrete._meta.offset_min == 0
+    assert cam_discrete._meta.offset_max == 2
+    assert await cam_discrete.get_gain() == 1.0
+    assert await cam_discrete.get_offset() == 0.0
+    await cam_discrete.set_gain(3.0)
+    await cam_discrete.set_offset(2.0)
+    assert await cam_discrete.get_gain() == 3.0
+    assert await cam_discrete.get_offset() == 2.0
+
+    # Unsupported camera (GainMin/Max, Gains, OffsetMin/Max, and Offsets all raise 1024)
+    fake_no_gain = FakeAlpacaCameraTransport(
+        {"GainMin": None, "GainMax": None, "OffsetMin": None, "OffsetMax": None}
+    )
+    cam_no_gain = _make_camera(fake_no_gain)
+    await cam_no_gain.open()
+    assert cam_no_gain._meta is not None
+    assert cam_no_gain._meta.gain_min is None
+    assert cam_no_gain._meta.offset_min is None
+
+    with pytest.raises(ValueError, match="does not support"):
+        await cam_no_gain.get_gain()
+    with pytest.raises(ValueError, match="does not support"):
+        await cam_no_gain.set_gain(100.0)
+    with pytest.raises(ValueError, match="does not support"):
+        await cam_no_gain.get_offset()
+    with pytest.raises(ValueError, match="does not support"):
+        await cam_no_gain.set_offset(10.0)
+
+
+@pytest.mark.asyncio
+async def test_reset_and_full_reset() -> None:
+    fake = FakeAlpacaCameraTransport()
+    cam = _make_camera(fake, default_gain=100.0, default_offset=15.0)
+    await cam.open()
+    assert ("Gain", {"Gain": 100}) in fake.puts
+    assert ("Offset", {"Offset": 15}) in fake.puts
+    assert await cam.get_gain() == 100.0
+    assert await cam.get_offset() == 15.0
 
     await cam.set_exposure_time(5.0)
     await cam.set_image_type(ImageType.DARK)
     await cam.set_binning(2, 2)
     await cam.set_window(10, 20, 200, 100)
+    await cam.set_gain(300.0)
+    await cam.set_offset(50.0)
     await cam.reset()
     assert cam._exposure_time == 0.0
     assert cam._image_type == ImageType.OBJECT
     assert await cam.get_binning() == (1, 1)
     assert await cam.get_window() == (0, 0, 1936, 1096)
+    assert await cam.get_gain() == 100.0
+    assert await cam.get_offset() == 15.0
 
     fake.puts.clear()
     await cam.full_reset()
@@ -277,6 +385,8 @@ async def test_expose_applies_binned_roi_and_populates_headers() -> None:
     assert img.header["XORGSUBF"] == 20
     assert img.header["YORGSUBF"] == 40
     assert img.header["EXPTIME"] == 0.02
+    assert img.header["GAIN"] == 120.0
+    assert img.header["OFFSET"] == 10.0
     assert img.header["INSTRUME"] == "ZWO ASI290MM Mini"
     assert img.header["DETECTOR"] == "IMX290"
     assert img.header["DET-PIXL"] == pytest.approx(0.0029)
@@ -284,19 +394,25 @@ async def test_expose_applies_binned_roi_and_populates_headers() -> None:
     assert img.header["DATAMAX"] == 800.0
     assert "BAYERPAT" not in img.header
 
-    # Changing window or binning while an exposure is in flight must not corrupt that exposure's FITS header
+    # Changing window, binning, gain, or offset mid-exposure must not corrupt the in-flight FITS header
     await cam.set_binning(1, 1)
     await cam.set_window(0, 0, 1936, 1096)
+    await cam.set_gain(120.0)
+    await cam.set_offset(10.0)
     fake.image_ready_sequence = [False, True]
     expose_task = asyncio.create_task(cam._expose(0.05, open_shutter=True, abort_event=asyncio.Event()))
     await asyncio.sleep(0)
     await cam.set_binning(2, 2)
     await cam.set_window(100, 100, 400, 300)
+    await cam.set_gain(300.0)
+    await cam.set_offset(50.0)
     inflight_img = await expose_task
     assert inflight_img.header["XBINNING"] == 1
     assert inflight_img.header["YBINNING"] == 1
     assert inflight_img.header["XORGSUBF"] == 0
     assert inflight_img.header["YORGSUBF"] == 0
+    assert inflight_img.header["GAIN"] == 120.0
+    assert inflight_img.header["OFFSET"] == 10.0
 
 
 @pytest.mark.asyncio
