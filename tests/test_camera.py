@@ -7,7 +7,17 @@ from unittest.mock import AsyncMock
 import numpy as np
 import pytest
 from numpy.typing import NDArray
-from pyobs.interfaces import Binning, GainState, IBinning, IGain, IWindow
+from pyobs.interfaces import (
+    Binning,
+    CoolingState,
+    GainState,
+    IBinning,
+    ICooling,
+    IGain,
+    ITemperatures,
+    IWindow,
+    TemperaturesState,
+)
 from pyobs.utils import exceptions as exc
 from pyobs.utils.enums import ExposureStatus, ImageType
 
@@ -33,6 +43,13 @@ class FakeAlpacaCameraTransport:
             "BayerOffsetX": 0,
             "BayerOffsetY": 0,
             "CanAbortExposure": True,
+            "CanSetCCDTemperature": True,
+            "CanGetCoolerPower": True,
+            "CCDTemperature": -10.5,
+            "HeatSinkTemperature": 22.0,
+            "CoolerOn": True,
+            "SetCCDTemperature": -10.0,
+            "CoolerPower": 45.0,
             "GainMin": 0,
             "GainMax": 600,
             "Gain": 120,
@@ -81,6 +98,10 @@ class FakeAlpacaCameraTransport:
             self.props["Gain"] = int(kwargs["Gain"])
         elif attribute == "Offset" and "Offset" in kwargs:
             self.props["Offset"] = int(kwargs["Offset"])
+        elif attribute == "CoolerOn" and "CoolerOn" in kwargs:
+            self.props["CoolerOn"] = bool(kwargs["CoolerOn"])
+        elif attribute == "SetCCDTemperature" and "SetCCDTemperature" in kwargs:
+            self.props["SetCCDTemperature"] = float(kwargs["SetCCDTemperature"])
         return None
 
     async def get_imagebytes(self, attribute: str = "imagearray", timeout: float = 30.0) -> NDArray[Any]:
@@ -98,6 +119,7 @@ def _make_camera(
     fake: FakeAlpacaCameraTransport,
     poll_interval: float = 0.01,
     readout_timeout: float = 0.5,
+    cooling_setpoint: float | None = None,
     default_gain: float | None = None,
     default_offset: float | None = None,
 ) -> AlpacaCamera:
@@ -107,11 +129,13 @@ def _make_camera(
         device=0,
         poll_interval=poll_interval,
         readout_timeout=readout_timeout,
+        cooling_setpoint=cooling_setpoint,
         default_gain=default_gain,
         default_offset=default_offset,
     )
     cam._device = fake  # type: ignore[assignment]
     cam._child_objects = [fake]  # type: ignore[list-item]
+    cam._background_tasks.clear()
     cam.comm.set_capabilities = AsyncMock()  # type: ignore[method-assign]
     cam.comm.set_state = AsyncMock()  # type: ignore[method-assign]
     cam.comm.send_event = AsyncMock()  # type: ignore[method-assign]
@@ -146,6 +170,8 @@ async def test_open_monochrome_skips_bayer_offsets_and_publishes_capabilities() 
     assert cam._meta.sensor_type == 0
     assert cam._meta.bayer_offset_x == 0
     assert cam._meta.bayer_offset_y == 0
+    assert cam._meta.can_set_ccd_temperature is True
+    assert cam._meta.can_get_cooler_power is True
     assert cam._meta.gain_min == 0
     assert cam._meta.gain_max == 600
     assert cam._meta.offset_min == 0
@@ -158,6 +184,8 @@ async def test_open_monochrome_skips_bayer_offsets_and_publishes_capabilities() 
     assert await cam.get_binning() == (1, 1)
     assert await cam.get_gain() == 120.0
     assert await cam.get_offset() == 10.0
+    assert await cam.get_temperatures() == {"CCD": -10.5, "Heatsink": 22.0}
+    assert await cam.get_cooling_status() == (True, -10.0, 45.0)
 
     cap_calls = {call.args[0]: call.args[1] for call in cam.comm.set_capabilities.call_args_list}  # type: ignore[attr-defined]
     assert cap_calls[IWindow].full_frame_width == 1936
@@ -301,9 +329,7 @@ async def test_gain_and_offset_supported_and_unsupported() -> None:
     assert await cam_discrete.get_offset() == 2.0
 
     # Unsupported camera (GainMin/Max, Gains, OffsetMin/Max, and Offsets all raise 1024)
-    fake_no_gain = FakeAlpacaCameraTransport(
-        {"GainMin": None, "GainMax": None, "OffsetMin": None, "OffsetMax": None}
-    )
+    fake_no_gain = FakeAlpacaCameraTransport({"GainMin": None, "GainMax": None, "OffsetMin": None, "OffsetMax": None})
     cam_no_gain = _make_camera(fake_no_gain)
     await cam_no_gain.open()
     assert cam_no_gain._meta is not None
@@ -321,14 +347,70 @@ async def test_gain_and_offset_supported_and_unsupported() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reset_and_full_reset() -> None:
+async def test_cooling_and_temperatures_supported_and_unsupported() -> None:
     fake = FakeAlpacaCameraTransport()
-    cam = _make_camera(fake, default_gain=100.0, default_offset=15.0)
+    cam = _make_camera(fake)
+    await cam.open()
+
+    assert await cam.get_temperatures() == {"CCD": -10.5, "Heatsink": 22.0}
+    assert await cam.get_cooling_status() == (True, -10.0, 45.0)
+
+    temp_calls = [call.args[1] for call in cam.comm.set_state.call_args_list if call.args[0] is ITemperatures]  # type: ignore[attr-defined]
+    assert isinstance(temp_calls[-1], TemperaturesState)
+    assert {(r.name, r.value) for r in temp_calls[-1].readings} == {("CCD", -10.5), ("Heatsink", 22.0)}
+
+    await cam.set_cooling(True, -15.0)
+    assert ("CoolerOn", {"CoolerOn": True}) in fake.puts
+    assert ("SetCCDTemperature", {"SetCCDTemperature": -15.0}) in fake.puts
+    assert await cam.get_cooling_status() == (True, -15.0, 45.0)
+
+    cool_calls = [call.args[1] for call in cam.comm.set_state.call_args_list if call.args[0] is ICooling]  # type: ignore[attr-defined]
+    assert isinstance(cool_calls[-1], CoolingState)
+    assert cool_calls[-1].enabled is True
+    assert cool_calls[-1].setpoint == -15.0
+    assert cool_calls[-1].power == 45
+
+    fake.puts.clear()
+    await cam.set_cooling(False, 0.0)
+    assert ("CoolerOn", {"CoolerOn": False}) in fake.puts
+    assert all(k != "SetCCDTemperature" for k, _ in fake.puts)
+    assert await cam.get_cooling_status() == (False, 0.0, 45.0)
+
+    with pytest.raises(ValueError, match="finite"):
+        await cam.set_cooling(True, float("nan"))
+
+    # Uncooled camera (CanSetCCDTemperature=False, CanGetCoolerPower=False, HeatSinkTemperature raises 1024)
+    fake_uncooled = FakeAlpacaCameraTransport(
+        {
+            "CanSetCCDTemperature": False,
+            "CanGetCoolerPower": False,
+            "HeatSinkTemperature": None,
+            "SetCCDTemperature": None,
+            "CoolerOn": False,
+            "CCDTemperature": 20.0,
+        }
+    )
+    cam_uncooled = _make_camera(fake_uncooled)
+    await cam_uncooled.open()
+    assert await cam_uncooled.get_temperatures() == {"CCD": 20.0}
+    assert await cam_uncooled.get_cooling_status() == (False, None, None)
+
+    with pytest.raises(ValueError, match="does not support controllable cooling"):
+        await cam_uncooled.set_cooling(True, -10.0)
+
+
+@pytest.mark.asyncio
+async def test_reset_and_full_reset() -> None:
+    fake = FakeAlpacaCameraTransport({"CoolerOn": False, "SetCCDTemperature": -10.0})
+    cam = _make_camera(fake, cooling_setpoint=-20.0, default_gain=100.0, default_offset=15.0)
     await cam.open()
     assert ("Gain", {"Gain": 100}) in fake.puts
     assert ("Offset", {"Offset": 15}) in fake.puts
+    assert ("CoolerOn", {"CoolerOn": True}) in fake.puts
+    assert ("SetCCDTemperature", {"SetCCDTemperature": -20.0}) in fake.puts
     assert await cam.get_gain() == 100.0
     assert await cam.get_offset() == 15.0
+    assert await cam.get_cooling_status() == (True, -20.0, 45.0)
 
     await cam.set_exposure_time(5.0)
     await cam.set_image_type(ImageType.DARK)
@@ -348,6 +430,8 @@ async def test_reset_and_full_reset() -> None:
     await cam.full_reset()
     assert ("Connected", {"Connected": False}) in fake.puts
     assert ("Connected", {"Connected": True}) in fake.puts
+    assert ("CoolerOn", {"CoolerOn": True}) in fake.puts
+    assert ("SetCCDTemperature", {"SetCCDTemperature": -20.0}) in fake.puts
 
     cam._camera_status = ExposureStatus.EXPOSING
     with pytest.raises(exc.DeviceBusyError):
@@ -387,6 +471,9 @@ async def test_expose_applies_binned_roi_and_populates_headers() -> None:
     assert img.header["EXPTIME"] == 0.02
     assert img.header["GAIN"] == 120.0
     assert img.header["OFFSET"] == 10.0
+    assert img.header["DET-TEMP"] == -10.5
+    assert img.header["DET-CPWR"] == 45.0
+    assert img.header["DET-TSET"] == -10.0
     assert img.header["INSTRUME"] == "ZWO ASI290MM Mini"
     assert img.header["DETECTOR"] == "IMX290"
     assert img.header["DET-PIXL"] == pytest.approx(0.0029)

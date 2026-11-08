@@ -16,11 +16,16 @@ from pyobs.interfaces import (
     Binning,
     BinningCapabilities,
     BinningState,
+    CoolingState,
     GainState,
     IAbortable,
     IBinning,
+    ICooling,
     IGain,
+    ITemperatures,
     IWindow,
+    SensorReading,
+    TemperaturesState,
     WindowCapabilities,
     WindowState,
 )
@@ -54,6 +59,8 @@ class CameraMetadata:
     bayer_offset_x: int
     bayer_offset_y: int
     can_abort_exposure: bool
+    can_set_ccd_temperature: bool
+    can_get_cooler_power: bool
     gain_min: int | None
     gain_max: int | None
     offset_min: int | None
@@ -66,6 +73,7 @@ class AlpacaCamera(
     BaseCamera,
     IWindow,
     IBinning,
+    ICooling,
     IGain,
     IAbortable,
 ):
@@ -75,6 +83,7 @@ class AlpacaCamera(
 
     def __init__(
         self,
+        cooling_setpoint: float | None = None,
         default_gain: float | None = None,
         default_offset: float | None = None,
         poll_interval: float = 0.2,
@@ -89,11 +98,13 @@ class AlpacaCamera(
         super().__init__(
             **{k: v for k, v in kwargs.items() if k not in DEVICE_INIT_KWARGS},
         )
+        self.add_background_task(self._update_cooling, True)
 
         device_kwargs = {k: v for k, v in kwargs.items() if k in DEVICE_INIT_KWARGS | OBJECT_SHARED_KWARGS}
         device_kwargs.setdefault("device_type", "camera")
         self._device: AlpacaDevice = self.add_child_object(AlpacaDevice, **device_kwargs)
 
+        self._default_cooling_setpoint = cooling_setpoint
         self._default_gain = default_gain
         self._default_offset = default_offset
         self._poll_interval = poll_interval
@@ -104,6 +115,10 @@ class AlpacaCamera(
         self._binning: tuple[int, int] = (1, 1)
         self._gain: float | None = None
         self._offset: float | None = None
+        self._cooling_enabled: bool = False
+        self._cooling_setpoint: float | None = cooling_setpoint
+        self._cooling_power: float | None = None
+        self._temperatures: dict[str, float] = {}
 
     async def _try_get(self, attribute: str) -> Any:
         """Query an optional ASCOM property that may raise PropertyNotImplemented (1024)."""
@@ -139,6 +154,8 @@ class AlpacaCamera(
                 bayer_offset_y = int(raw_by)
 
         can_abort_exposure = bool(await self._device.get("CanAbortExposure"))
+        can_set_ccd_temperature = bool(await self._device.get("CanSetCCDTemperature"))
+        can_get_cooler_power = bool(await self._device.get("CanGetCoolerPower"))
 
         raw_gain_min = await self._try_get("GainMin")
         raw_gain_max = await self._try_get("GainMax")
@@ -183,6 +200,8 @@ class AlpacaCamera(
             bayer_offset_x=bayer_offset_x,
             bayer_offset_y=bayer_offset_y,
             can_abort_exposure=can_abort_exposure,
+            can_set_ccd_temperature=can_set_ccd_temperature,
+            can_get_cooler_power=can_get_cooler_power,
             gain_min=gain_min,
             gain_max=gain_max,
             offset_min=offset_min,
@@ -261,6 +280,59 @@ class AlpacaCamera(
                     offset=self._offset if self._offset is not None else 0.0,
                 ),
             )
+        if self._default_cooling_setpoint is not None and meta.can_set_ccd_temperature:
+            await self.set_cooling(True, self._default_cooling_setpoint)
+        await self._poll_cooling()
+
+    async def _poll_cooling(self) -> None:
+        """Query temperatures and cooler status from the Alpaca camera and publish states."""
+        if self._meta is None:
+            return
+
+        temps: dict[str, float] = {}
+        raw_ccd_temp = await self._try_get("CCDTemperature")
+        if raw_ccd_temp is not None:
+            temps["CCD"] = float(raw_ccd_temp)
+
+        raw_heatsink_temp = await self._try_get("HeatSinkTemperature")
+        if raw_heatsink_temp is not None:
+            temps["Heatsink"] = float(raw_heatsink_temp)
+
+        self._temperatures = temps
+
+        raw_cooler_on = await self._try_get("CoolerOn")
+        self._cooling_enabled = bool(raw_cooler_on) if raw_cooler_on is not None else False
+
+        if self._meta.can_set_ccd_temperature:
+            raw_setpoint = await self._try_get("SetCCDTemperature")
+            if raw_setpoint is not None:
+                self._cooling_setpoint = float(raw_setpoint)
+
+        if self._meta.can_get_cooler_power:
+            raw_power = await self._try_get("CoolerPower")
+            self._cooling_power = float(raw_power) if raw_power is not None else None
+        else:
+            self._cooling_power = None
+
+        await self.comm.set_state(
+            ITemperatures,
+            TemperaturesState(readings=[SensorReading(name=name, value=val) for name, val in temps.items()]),
+        )
+        await self.comm.set_state(
+            ICooling,
+            CoolingState(
+                setpoint=self._cooling_setpoint,
+                power=int(round(self._cooling_power)) if self._cooling_power is not None else None,
+                enabled=self._cooling_enabled,
+            ),
+        )
+
+    async def _update_cooling(self) -> None:
+        """Background task periodically polling camera temperatures and cooler status."""
+        while True:
+            if self._meta is not None:
+                await self._poll_cooling()
+            await asyncio.sleep(5.0)
 
     async def close(self) -> None:
         """Close the camera module and release the underlying HTTP session."""
@@ -287,6 +359,8 @@ class AlpacaCamera(
         self._meta = await self._query_metadata()
         self._full_frame = (0, 0, self._meta.camera_x_size, self._meta.camera_y_size)
         await self.reset(**kwargs)
+        if self._default_cooling_setpoint is not None and self._meta.can_set_ccd_temperature:
+            await self.set_cooling(True, self._default_cooling_setpoint)
 
     async def get_full_frame(self, **kwargs: Any) -> tuple[int, int, int, int]:
         """Return full frame size of camera (left, top, width, height)."""
@@ -389,6 +463,37 @@ class AlpacaCamera(
             ),
         )
 
+    async def set_cooling(self, enabled: bool, setpoint: float, **kwargs: Any) -> None:
+        """Enable/disable camera cooling and set the target CCD temperature in Celsius."""
+        if self._meta is None or not self._meta.can_set_ccd_temperature:
+            raise ValueError("Camera does not support controllable cooling.")
+        if not math.isfinite(setpoint):
+            raise ValueError("Cooling setpoint must be finite.")
+        try:
+            await self._device.put("CoolerOn", CoolerOn=bool(enabled))
+            if enabled:
+                await self._device.put("SetCCDTemperature", SetCCDTemperature=float(setpoint))
+        except ConnectionError as e:
+            raise ValueError(f"Could not set camera cooling: {e}") from e
+        self._cooling_enabled = bool(enabled)
+        self._cooling_setpoint = float(setpoint)
+        await self.comm.set_state(
+            ICooling,
+            CoolingState(
+                setpoint=self._cooling_setpoint,
+                power=int(round(self._cooling_power)) if self._cooling_power is not None else None,
+                enabled=self._cooling_enabled,
+            ),
+        )
+
+    async def get_cooling_status(self, **kwargs: Any) -> tuple[bool, float | None, float | None]:
+        """Return the current cooling status (enabled, setpoint, power)."""
+        return (self._cooling_enabled, self._cooling_setpoint, self._cooling_power)
+
+    async def get_temperatures(self, **kwargs: Any) -> dict[str, float]:
+        """Return the most recently polled camera temperatures."""
+        return dict(self._temperatures)
+
     async def _apply_roi_and_binning(self, window: tuple[int, int, int, int], binning: tuple[int, int]) -> None:
         """Push binning and binned ROI coordinates to the Alpaca camera before exposure."""
         bx, by = binning
@@ -464,6 +569,13 @@ class AlpacaCamera(
                 .decode("ascii")
             )
             hdr["DETECTOR"] = (detector, "Name of detector")
+
+        if "CCD" in self._temperatures:
+            hdr["DET-TEMP"] = (self._temperatures["CCD"], "Temperature of detector [C]")
+        if self._cooling_power is not None:
+            hdr["DET-CPWR"] = (self._cooling_power, "Cooler power [%]")
+        if self._cooling_setpoint is not None:
+            hdr["DET-TSET"] = (self._cooling_setpoint, "Cooler setpoint [C]")
 
         if gain is not None:
             hdr["GAIN"] = (gain, "Gain used for exposure")
