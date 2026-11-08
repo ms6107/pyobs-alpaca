@@ -17,7 +17,7 @@ from pyobs.mixins.follow import FollowMixin
 from pyobs.object import Object
 from pyobs.utils.enums import MotionStatus
 
-from pyobs_alpaca import AlpacaDome, AlpacaFocuser, AlpacaTelescope
+from pyobs_alpaca import AlpacaCamera, AlpacaDome, AlpacaFocuser, AlpacaTelescope
 from pyobs_alpaca.device import DEVICE_INIT_KWARGS, OBJECT_SHARED_KWARGS, AlpacaDevice
 
 _DEVICE_ARGS = dict(server="localhost", port=11111, device_type="dome", device=0)
@@ -62,3 +62,17 @@ def test_telescope_constructor_threads_kwargs_cooperatively() -> None:
     )
     assert telescope.motion_status() == MotionStatus.UNKNOWN
     assert telescope._FitsNamespaceMixin__namespaces == {"instrument": None}  # type: ignore[attr-defined]
+
+
+def test_camera_constructor_threads_kwargs_cooperatively() -> None:
+    camera = AlpacaCamera(
+        poll_interval=0.1,
+        readout_timeout=15.0,
+        fits_namespaces=["telescope"],
+        server="localhost",
+        port=11111,
+        device=0,
+    )
+    assert camera._poll_interval == 0.1
+    assert camera._readout_timeout == 15.0
+    assert camera._device._type == "camera"

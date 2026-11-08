@@ -7,6 +7,8 @@ tasks, which never start until open() is called.
 """
 
 from pyobs.interfaces import (
+    IAbortable,
+    ICamera,
     IDome,
     IFitsHeaderBefore,
     IFocuser,
@@ -16,7 +18,7 @@ from pyobs.interfaces import (
 )
 from pyobs.object import Object
 
-from pyobs_alpaca import AlpacaDome, AlpacaFocuser, AlpacaTelescope
+from pyobs_alpaca import AlpacaCamera, AlpacaDome, AlpacaFocuser, AlpacaTelescope
 from pyobs_alpaca.device import AlpacaDevice
 
 _TELESCOPE_ARGS = dict(server="localhost", port=11111, device_type="telescope", device=0)
@@ -45,3 +47,9 @@ def test_import_focuser_and_instantiate() -> None:
 def test_import_dome_and_instantiate() -> None:
     dome = AlpacaDome(server="localhost", port=11111, device_type="dome", device=0)
     assert isinstance(dome, IDome)
+
+
+def test_import_camera_and_instantiate() -> None:
+    camera = AlpacaCamera(server="localhost", port=11111, device=0)
+    assert isinstance(camera, ICamera)
+    assert isinstance(camera, IAbortable)
